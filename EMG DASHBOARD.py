@@ -60,4 +60,3 @@ if uploaded_file:
 else:
     st.info("Please upload an Excel file to visualize the data.")
 
-.py
