@@ -4,3 +4,4 @@ altair
 scipy
 openpyxl
 plotly
+matplotlib
