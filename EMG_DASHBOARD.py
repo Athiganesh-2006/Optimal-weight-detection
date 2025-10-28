@@ -1,12 +1,4 @@
-"""
-EMG_Muscle_Dashboard.py
-Complete Streamlit app showing EMG physiological metrics + MPU6050 graphs.
 
-Usage:
-    streamlit run EMG_Muscle_Dashboard.py
-For Render/hosting:
-    streamlit run EMG_Muscle_Dashboard.py --server.port $PORT --server.address 0.0.0.0
-"""
 
 import os
 import streamlit as st
@@ -436,4 +428,4 @@ st.caption("EMG Muscle & Physiology Dashboard — computes RMS, contractions, me
 
 # For hosting platforms that provide PORT variable (Render)
 if "PORT" in os.environ:
-    st.write(f"Running on port {os.environ.get('PORT')} (hosting platform assigned)")
+    st.write(f"Running on port {os.environ.get('PORT')} (hosting platform  assigned)") 
