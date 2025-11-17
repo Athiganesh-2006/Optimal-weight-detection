@@ -5,3 +5,4 @@ scipy
 openpyxl
 plotly
 matplotlib
+kaleido
