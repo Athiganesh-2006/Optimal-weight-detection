@@ -29,7 +29,6 @@ def find_first_match(names_lower, candidates):
     return None
 
 def safe_read_excel(file_stream):
-    # returns a pandas ExcelFile
     try:
         xls = pd.ExcelFile(file_stream)
         return xls
@@ -37,7 +36,6 @@ def safe_read_excel(file_stream):
         raise RuntimeError(f"Unable to read Excel file: {e}")
 
 def ensure_numeric(arr):
-    # converts arrays to numeric dtype; returns np.array of floats
     a = np.array(arr)
     if a.dtype.kind in 'OSU':  # object/string
         a = pd.to_numeric(a, errors='coerce').astype(float)
@@ -48,7 +46,6 @@ def ensure_numeric(arr):
 def movmean(x, win):
     if win <= 1:
         return x
-    # use convolution for moving average
     w = np.ones(win) / win
     out = np.convolve(x, w, mode='same')
     return out
@@ -56,34 +53,28 @@ def movmean(x, win):
 def compute_envelope_from_raw(raw, fs, bp_low, bp_high, bp_order, env_win_samples):
     raw = np.asarray(raw, dtype=float)
     raw = raw - np.nanmean(raw)
-    # design bandpass (safeguard)
     nyq = fs / 2.0
     low = bp_low / nyq
     high = bp_high / nyq
     if low <= 0: low = 1e-6
     if high >= 1: high = 0.999999
     if low >= high:
-        # fallback: no filtering
         spiky = raw.copy()
     else:
         try:
             b, a = signal.butter(bp_order, [low, high], btype='band')
             spiky = signal.filtfilt(b, a, raw)
         except Exception:
-            # fallback to causal filter if filtfilt fails
             b, a = signal.butter(bp_order, [low, high], btype='band')
             spiky = signal.lfilter(b, a, raw)
-    # envelope: RMS via movmean on squared signal
     squared = np.abs(spiky) ** 2
     env = np.sqrt(movmean(squared, env_win_samples))
     return spiky, env
 
 def synthesize_spiky_from_rms(rms, fs, bp_low, bp_high, bp_order, env_win_samples, random_seed=None):
-    # create band-limited noise, measure its envelope, scale to RMS
     N = len(rms)
     rng = np.random.default_rng(random_seed)
     noise = rng.standard_normal(N)
-    # bandpass filter the noise
     nyq = fs / 2.0
     low = max(bp_low / nyq, 1e-6)
     high = min(bp_high / nyq, 0.999999)
@@ -93,12 +84,10 @@ def synthesize_spiky_from_rms(rms, fs, bp_low, bp_high, bp_order, env_win_sample
     except Exception:
         b, a = signal.butter(bp_order, [low, high], btype='band')
         w = signal.lfilter(b, a, noise)
-    # envelope of w:
     mov = np.sqrt(movmean(w**2, env_win_samples))
     mov[mov == 0] = np.finfo(float).eps
-    # scale w to match target rms
     w_scaled = w * (rms / mov)
-    env = rms  # keep the given RMS envelope
+    env = rms
     return w_scaled, env
 
 # -----------------------
@@ -108,8 +97,7 @@ st.sidebar.title("EMG Review Dashboard")
 st.sidebar.write("Upload an Excel file with sheet(s) containing EMG data (time, raw, or RMS).")
 
 uploaded = st.sidebar.file_uploader("Excel (.xlsx/.xls)", type=["xlsx", "xls"])
-if uploaded is None:
-    st.sidebar.info("Upload an Excel file to enable processing options.")
+st.sidebar.markdown("---")
 
 st.sidebar.markdown("### Processing options")
 sampling_rate = st.sidebar.number_input("Sampling Rate (Hz)", value=1000, min_value=1, step=1)
@@ -135,8 +123,7 @@ run_button = st.sidebar.button("Process & Plot")
 # Main panel - header
 # -----------------------
 st.title("EMG Review — Spiky + Envelope Dashboard")
-st.write("This dashboard visualizes EMG traces as 'spiky' bandpassed signals and their RMS envelopes. "
-         "It can synthesize a spiky signal from RMS-only sheets and export processed results.")
+st.write("Visualize EMG 'spiky' traces and RMS envelopes. Can synthesize spiky from RMS-only sheets, and export results.")
 
 if uploaded is None:
     st.info("Upload an Excel file using the sidebar to begin.")
@@ -162,11 +149,11 @@ except Exception as e:
     st.error(f"Unable to read sheet {sheet}: {e}")
     st.stop()
 
-st.write("### Preview")
+st.write("### Preview (first rows)")
 st.dataframe(df_preview.head())
 
-# allow user to override column detection if desired
-st.write("### Column detection (automatic)")
+# Column detection / overrides
+st.write("### Column detection (automatic — override if needed)")
 cols = df_preview.columns.tolist()
 cols_lower = lower_list(cols)
 
@@ -174,32 +161,21 @@ time_guess = find_first_match(cols_lower, TIME_CANDIDATES)
 rms_guess = find_first_match(cols_lower, EMG_RMS_CANDIDATES)
 raw_guess = find_first_match(cols_lower, EMG_RAW_CANDIDATES)
 
-col_time = st.selectbox("Time column (detected)", options=[None] + cols, index=(cols.index(cols[time_guess]) + 1) if time_guess is not None else 0)
-col_rms = st.selectbox("EMG RMS column (detected)", options=[None] + cols, index=(cols.index(cols[rms_guess]) + 1) if rms_guess is not None else 0)
-col_raw = st.selectbox("EMG Raw column (detected)", options=[None] + cols, index=(cols.index(cols[raw_guess]) + 1) if raw_guess is not None else 0)
+# show options with None first
+col_time = st.selectbox("Time column (detected)", options=[None] + cols, index=0 if time_guess is None else (cols.index(cols[time_guess]) + 1))
+col_rms = st.selectbox("EMG RMS column (detected)", options=[None] + cols, index=0 if rms_guess is None else (cols.index(cols[rms_guess]) + 1))
+col_raw = st.selectbox("EMG Raw column (detected)", options=[None] + cols, index=0 if raw_guess is None else (cols.index(cols[raw_guess]) + 1))
 
 # -----------------------
 # Processing engine
 # -----------------------
 def process_sheet_table(table: pd.DataFrame, time_col=None, raw_col=None, rms_col=None,
-                        fs=1000, bp_low_hz=20.0, bp_high_hz=450.0, bp_order=4, env_win_samples=50,
-                        baseline_sheets=BASELINE_SHEETS):
-    """
-    Returns a dict:
-      {
-        'sheet_name': name,
-        'time': np.array,
-        'spiky': np.array,
-        'env': np.array,
-        'xEnd': float
-      }
-    """
+                        fs=1000, bp_low_hz=20.0, bp_high_hz=450.0, bp_order=4, env_win_samples=50):
     T = table.copy()
     names = T.columns.tolist()
     names_lower = lower_list(names)
 
-    # find columns if not provided
-    # time
+    # time column selection
     if time_col is None:
         idx = find_first_match(names_lower, TIME_CANDIDATES)
         time_col_use = names[idx] if idx is not None else names[0]
@@ -220,24 +196,21 @@ def process_sheet_table(table: pd.DataFrame, time_col=None, raw_col=None, rms_co
 
     # Extract time
     Time = T[time_col_use] if time_col_use in T.columns else pd.Series(np.arange(len(T)))
-    # robust convert time to seconds numeric if possible
     if np.issubdtype(Time.dtype, np.datetime64):
         Time = (Time - Time.iloc[0]).dt.total_seconds()
     Time = ensure_numeric(Time)
-    # fallback if entire column NaN
     if np.all(np.isnan(Time)):
         Time = np.arange(len(T)) / float(fs)
 
-    # extract RMS
+    # Extract RMS and raw if present
     EMGrms = None
     if rms_col_use and rms_col_use in T.columns:
         EMGrms = ensure_numeric(T[rms_col_use].values)
-    # extract raw
     EMGraw = None
     if raw_col_use and raw_col_use in T.columns:
         EMGraw = ensure_numeric(T[raw_col_use].values)
 
-    # Drop rows where time or rms are NaN
+    # Remove rows with NaNs in essential columns
     mask = ~np.isnan(Time)
     if EMGrms is not None:
         mask = mask & ~np.isnan(EMGrms)
@@ -261,7 +234,7 @@ def process_sheet_table(table: pd.DataFrame, time_col=None, raw_col=None, rms_co
     local_bp_low = float(bp_low_hz)
     local_bp_high = float(bp_high_hz)
     if fs_est <= 2 * local_bp_high:
-        local_bp_high = max( (fs_est / 2.0) - 1.0, local_bp_low + 1.0)
+        local_bp_high = max((fs_est / 2.0) - 1.0, local_bp_low + 1.0)
 
     # Build spiky and env
     if EMGraw is not None and len(EMGraw) >= 3:
@@ -269,31 +242,23 @@ def process_sheet_table(table: pd.DataFrame, time_col=None, raw_col=None, rms_co
     elif EMGrms is not None:
         spiky, env = synthesize_spiky_from_rms(EMGrms, fs_est, local_bp_low, local_bp_high, bp_order, env_win_samples, random_seed=42)
     else:
-        # nothing useful
         raise ValueError("Sheet contains neither raw EMG nor RMS columns we can detect.")
 
-    # Determine xEnd based on sheet name heuristic
-    # If sheet name indicates baseline, short xEnd
-    # else longer trial default
-    # caller can adjust
     return {
         'time': np.array(Time, dtype=float),
         'spiky': np.array(spiky, dtype=float),
-        'env': np.array(env, dtype=float),
-        'fs_est': fs_est
+        'env': np.array(env, dtype=float)
     }
 
 # -----------------------
 # Plotting utility
 # -----------------------
 def plot_polished_tiles(data_list, title_prefix="EMG"):
-    # data_list: list of dicts with keys: sheet_name, time, spiky, env, xEnd
     n = len(data_list)
     if n == 0:
         st.warning("No data to plot.")
         return
 
-    # compute global amplitude
     global_max = 0.0
     for d in data_list:
         global_max = max(global_max, np.nanmax(np.abs(np.concatenate([d['spiky'], d['env']] ))))
@@ -304,7 +269,6 @@ def plot_polished_tiles(data_list, title_prefix="EMG"):
     YL = (-Ymax, Ymax)
     y_ticks = np.arange(YL[0], YL[1] + 1e-9, 0.5)
 
-    # Create tiled layout: try square-ish grid
     rows = int(np.ceil(np.sqrt(n)))
     cols = int(np.ceil(n / rows))
 
@@ -321,7 +285,6 @@ def plot_polished_tiles(data_list, title_prefix="EMG"):
         env = d['env']
         sheet = d.get('sheet_name', f"Sheet {i+1}")
 
-        # If Time doesn't reach xEnd, append last point to extend to xEnd
         sheet_lower = sheet.lower()
         if any(key in sheet_lower for key in BASELINE_SHEETS):
             xEnd = 5
@@ -330,7 +293,6 @@ def plot_polished_tiles(data_list, title_prefix="EMG"):
             xEnd = 15
             xticks = np.arange(0, xEnd + 0.1, 1.0)
 
-        # sort
         order = np.argsort(Time)
         Time_s = Time[order]
         sp = spiky[order]
@@ -341,14 +303,7 @@ def plot_polished_tiles(data_list, title_prefix="EMG"):
             sp = np.concatenate([sp, [sp[-1]]])
             en = np.concatenate([en, [en[-1]]])
 
-        # fill envelope ±env (use alpha)
-        upper = en
-        lower_env = -en
-        xx = np.concatenate([Time_s, Time_s[::-1]])
-        yy = np.concatenate([upper, lower_env[::-1]])
-        ax.fill_between(Time_s, lower_env, upper, color=(1.0, 0.6, 0.2), alpha=0.18, edgecolor='none')
-
-        # spiky & envelope lines
+        ax.fill_between(Time_s, -en, en, color=(1.0, 0.6, 0.2), alpha=0.18, edgecolor='none')
         ax.plot(Time_s, sp, color=(0.0, 0.4470, 0.7410, 0.65), linewidth=0.6)
         ax.plot(Time_s, en, color=(0.85, 0.325, 0.098), linewidth=1.2)
         ax.plot(Time_s, -en, color=(0.85, 0.325, 0.098, 0.6), linestyle='--', linewidth=0.9)
@@ -370,7 +325,6 @@ def plot_polished_tiles(data_list, title_prefix="EMG"):
 # Run processing
 # -----------------------
 if run_button:
-    # decide sheets to process
     if process_mode == "Selected sheet only":
         sheets_to_process = [sheet]
     else:
@@ -383,11 +337,10 @@ if run_button:
     for sh in sheets_to_process:
         try:
             df_sh = pd.read_excel(xls, sheet_name=sh)
-            # choose columns: use user-chosen overrides only if processing the selected sheet
             if sh == sheet:
-                tcol = col_time if col_time != "None" else None
-                rcol = col_rms if col_rms != "None" else None
-                rawcol = col_raw if col_raw != "None" else None
+                tcol = col_time
+                rcol = col_rms
+                rawcol = col_raw
             else:
                 tcol = None; rcol = None; rawcol = None
 
@@ -411,13 +364,14 @@ if run_button:
         # Plot polished tiles
         plot_polished_tiles(processed_results, title_prefix="EMG")
 
-        # Build export: multi-sheet Excel + option for zip of CSVs
+        # Build export: multi-sheet Excel or ZIP of CSVs
         st.write("### Export processed results")
         export_mode = st.radio("Export format", options=["Single multi-sheet Excel (.xlsx)", "ZIP of CSVs"], index=0)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         if export_mode.startswith("Single"):
             out = io.BytesIO()
+            # Use context manager (no writer.save())
             with pd.ExcelWriter(out, engine='openpyxl') as writer:
                 for d in processed_results:
                     dfout = pd.DataFrame({
@@ -425,14 +379,18 @@ if run_button:
                         'spiky': d['spiky'],
                         'env': d['env']
                     })
-                    # ensure sheet name length safe for Excel
-                    sheet_safe = (d['sheet_name'][:30]) if d['sheet_name'] else f"Sheet_{len(d)}"
+                    sheet_safe = (d['sheet_name'][:30]) if d.get('sheet_name') else f"Sheet_{len(d)}"
+                    # Excel limits sheet names to 31 chars; ensure no invalid chars
+                    sheet_safe = sheet_safe.replace('/', '_').replace('\\', '_')
                     dfout.to_excel(writer, sheet_name=sheet_safe, index=False)
-                writer.save()
             out.seek(0)
-            st.download_button(f"Download processed_{timestamp}.xlsx", data=out, file_name=f"processed_{timestamp}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button(
+                label=f"Download processed_{timestamp}.xlsx",
+                data=out,
+                file_name=f"processed_{timestamp}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
         else:
-            # zip of CSVs
             in_memory = io.BytesIO()
             with zipfile.ZipFile(in_memory, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
                 for d in processed_results:
@@ -443,11 +401,16 @@ if run_button:
                     })
                     csv_bytes = dfout.to_csv(index=False).encode('utf-8')
                     filename = f"{d['sheet_name'][:80]}.csv"
+                    filename = filename.replace('/', '_').replace('\\', '_')
                     zf.writestr(filename, csv_bytes)
             in_memory.seek(0)
-            st.download_button(f"Download processed_{timestamp}.zip", data=in_memory, file_name=f"processed_{timestamp}.zip", mime="application/zip")
+            st.download_button(
+                label=f"Download processed_{timestamp}.zip",
+                data=in_memory,
+                file_name=f"processed_{timestamp}.zip",
+                mime="application/zip"
+            )
 
     st.balloons()
-
 else:
     st.write("Click **Process & Plot** in the sidebar to start processing the selected sheet(s).")
