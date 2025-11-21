@@ -1,379 +1,453 @@
-# app.py
-import io
-import numpy as np
-import pandas as pd
+# streamlit_emg_dashboard.py
 import streamlit as st
-import plotly.graph_objects as go
-from scipy.signal import butter, sosfiltfilt, convolve
-from typing import Optional, Tuple
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import signal
+import io
+import zipfile
+from datetime import datetime
 
-# --- CONFIG ---
-st.set_page_config(page_title="EMG Signal Analysis Dashboard", layout="wide")
+st.set_page_config(page_title="EMG Review Dashboard", layout="wide", initial_sidebar_state="expanded")
 
-# --- CUSTOM CSS FOR PROFESSIONAL LOOK ---
-st.markdown("""
-<style>
-    /* Main Streamlit container background */
-    .stApp {
-        background-color: #f8f9fa; 
-    }
-    /* Title font style */
-    .st-emotion-cache-1jm6hpn {
-        color: #1a1a1a;
-        font-weight: 700;
-    }
-    /* Sidebar header */
-    [data-testid="stSidebar"] .st-emotion-cache-14ymf9f {
-        color: #1a1a1a;
-        font-size: 1.25rem;
-    }
-    /* Button styling */
-    .stButton>button {
-        background-color: #007bff;
-        color: white;
-        border-radius: 5px;
-        border: none;
-        padding: 10px 20px;
-    }
-    .stButton>button:hover {
-        background-color: #0056b3;
-    }
-</style>
-""", unsafe_allow_html=True)
+# -----------------------
+# Helper utilities
+# -----------------------
+TIME_CANDIDATES = ['time', 't', 'seconds', 'sec', 'timestamp', 'time (s)', 'time_s']
+EMG_RMS_CANDIDATES = ['emgrms', 'rms', 'emg_rms', 'channel_1_rms', 'rms_value', 'rms(mv)', 'rms_mv']
+EMG_RAW_CANDIDATES = ['emg_raw', 'emgraw', 'emg', 'ch1', 'channel1', 'channel_1', 'raw', 'raw_emg', 'channel_1_mv']
+BASELINE_SHEETS = ['baseline', 'base', 'rest']
 
-# ---------- Helper functions (Unchanged) ----------
-# (The helper functions read_workbook, to_numeric_series, moving_rms, moving_average, 
-# design_filter, and apply_sos_filter remain as they are functional and correct.)
+def lower_list(lst):
+    return ["" if x is None else str(x).lower() for x in lst]
 
-def read_workbook(file_bytes: bytes) -> dict:
-    """Read uploaded excel bytes and return dict of sheet_name -> DataFrame"""
-    with io.BytesIO(file_bytes) as fh:
-        xls = pd.ExcelFile(fh)
-        sheets = {}
-        for name in xls.sheet_names:
-            df = xls.parse(name, header=0)  # assume first row = header
-            sheets[name] = df
-    return sheets
+def find_first_match(names_lower, candidates):
+    for cand in candidates:
+        for idx, name in enumerate(names_lower):
+            if cand in name:
+                return idx
+    return None
 
-def to_numeric_series(s: pd.Series) -> pd.Series:
-    """Coerce values to numeric, replace non-convertible with NaN"""
-    return pd.to_numeric(s, errors="coerce")
-
-def moving_rms(arr: np.ndarray, window_samples: int) -> np.ndarray:
-    """Compute moving RMS. arr may contain NaN; result has NaN where insufficient data."""
-    if window_samples <= 1:
-        out = np.sqrt(np.nanmean(np.square(arr), axis=0))
-        return np.full_like(arr, out) if np.ndim(arr) == 1 else out
-    # square, replace NaN with 0 for convolution but keep count of valid elements
-    sq = np.square(np.nan_to_num(arr, nan=0.0))
-    kernel = np.ones(window_samples)
-    sum_sq = convolve(sq, kernel, mode='same')
-    # count of valid elements per window
-    valid = (~np.isnan(arr)).astype(float)
-    count = convolve(valid, kernel, mode='same')
-    # avoid division by zero
-    with np.errstate(invalid='ignore', divide='ignore'):
-        rms = np.sqrt(sum_sq / count)
-    rms[count == 0] = np.nan
-    return rms
-
-def moving_average(arr: np.ndarray, window_samples: int) -> np.ndarray:
-    if window_samples <= 1:
-        return arr.copy()
-    kernel = np.ones(window_samples) / window_samples
-    arr_n = np.nan_to_num(arr, nan=0.0)
-    sum_vals = convolve(arr_n, kernel, mode='same')
-    valid = (~np.isnan(arr)).astype(float)
-    count = convolve(valid, np.ones(window_samples), mode='same')
-    with np.errstate(invalid='ignore', divide='ignore'):
-        ma = sum_vals / count
-    ma[count == 0] = np.nan
-    return ma
-
-def design_filter(filter_type: str, cutoff: Tuple[float, Optional[float]], fs: float, order=4):
-    """Return second-order-sections (sos) for butterworth filter."""
-    ny = 0.5 * fs
-    if filter_type == 'band':
-        low, high = cutoff
-        if low <= 0 or high <= 0 or high <= low:
-            return None
-        lown = low / ny
-        highn = high / ny
-        sos = butter(order, [lown, highn], btype='bandpass', output='sos')
-        return sos
-    else:
-        c = cutoff
-        if (not c) or c <= 0:
-            return None
-        wn = c / ny
-        if wn >= 1.0:
-            return None
-        sos = butter(order, wn, btype='low' if filter_type == 'low' else 'high', output='sos')
-        return sos
-
-def apply_sos_filter(arr: np.ndarray, sos):
-    if sos is None:
-        return arr.copy()
-    nan_mask = np.isnan(arr)
-    if nan_mask.all():
-        return arr.copy()
-    x = arr.copy()
-    if nan_mask.any():
-        # simple linear interpolation of NaNs
-        idx = np.arange(x.size)
-        good = ~nan_mask
-        x[nan_mask] = np.interp(idx[nan_mask], idx[good], x[good])
-    y = sosfiltfilt(sos, x)
-    y[nan_mask] = np.nan
-    return y
-
-# ---------- UI & Processing Logic (Revised) ----------
-st.title("EMG Signal Analysis Dashboard 📈")
-st.markdown("---")
-
-uploaded_file = st.file_uploader("Choose Excel file (.xlsx/.xls)", type=['xlsx','xls'])
-
-if uploaded_file is not None:
-    file_bytes = uploaded_file.read()
+def safe_read_excel(file_stream):
+    # returns a pandas ExcelFile
     try:
-        sheets = read_workbook(file_bytes)
+        xls = pd.ExcelFile(file_stream)
+        return xls
     except Exception as e:
-        st.error(f"❌ Failed to read workbook: {e}")
-        st.stop()
+        raise RuntimeError(f"Unable to read Excel file: {e}")
 
-    # --- Sidebar: Sheet Selection + Params ---
-    st.sidebar.header("Data Selection & Parameters")
-    sheet_names = list(sheets.keys())
-    sel_sheet = st.sidebar.selectbox("Select Sheet", sheet_names)
-
-    df = sheets[sel_sheet].copy()
-    st.subheader(f"Data Sheet: **{sel_sheet}**")
-
-    # X-axis setup
-    cols = df.columns.tolist()
-    if len(cols) < 2:
-        st.warning("Sheet must have at least two columns (X + one channel).")
-        st.stop()
-    x_col = cols[0]
-    st.sidebar.info(f"X-axis column (time/index): **{x_col}**")
-    x_series = to_numeric_series(df[x_col])
-    x_is_numeric = not x_series.isna().all()
-
-    channel_choices = cols[1:]
-    sel_channels = st.sidebar.multiselect("Channels to Analyze", channel_choices, 
-                                          default=channel_choices[:min(3,len(channel_choices))])
-    
-    # Processed Data Options
-    st.sidebar.subheader("Signal Processing Settings")
-    sample_rate = st.sidebar.number_input("Sampling Rate ($f_s$) (Hz)", value=2000.0, min_value=1.0, format="%.1f")
-    
-    # RMS Window (for the envelope)
-    rms_window_ms = st.sidebar.slider("RMS Window (ms)", min_value=10.0, max_value=500.0, value=50.0, step=10.0)
-    
-    # Smoothing Window (for the final envelope curve)
-    smooth_window_samples = st.sidebar.number_input("Smoothing Window (samples)", value=5, min_value=1, step=1)
-
-    # --- Filter Options ---
-    st.sidebar.subheader("Filters (4th Order Butterworth)")
-    bandpass_enabled = st.sidebar.checkbox("Use Bandpass Filter", value=True)
-    
-    if bandpass_enabled:
-        bp_low = st.sidebar.number_input("Low Cutoff ($f_{low}$) (Hz)", value=20.0, min_value=0.0)
-        bp_high = st.sidebar.number_input("High Cutoff ($f_{high}$) (Hz)", value=450.0, min_value=0.0)
-        hp_cut, lp_cut = 0, 0 # Disable cascade if bandpass is on
+def ensure_numeric(arr):
+    # converts arrays to numeric dtype; returns np.array of floats
+    a = np.array(arr)
+    if a.dtype.kind in 'OSU':  # object/string
+        a = pd.to_numeric(a, errors='coerce').astype(float)
     else:
-        hp_cut = st.sidebar.number_input("Highpass Cutoff (Hz)", value=20.0, min_value=0.0)
-        lp_cut = st.sidebar.number_input("Lowpass Cutoff (Hz)", value=450.0, min_value=0.0)
-        bp_low, bp_high = 0, 0
+        a = a.astype(float)
+    return a
 
-    # --- Action Button ---
-    if st.sidebar.button("Process & Plot EMG Data 🚀"):
+def movmean(x, win):
+    if win <= 1:
+        return x
+    # use convolution for moving average
+    w = np.ones(win) / win
+    out = np.convolve(x, w, mode='same')
+    return out
 
-        if not sel_channels:
-            st.warning("Please select at least one channel to plot.")
-            st.stop()
-        
-        # Prepare x values
-        if x_is_numeric:
-            x_vals = x_series.to_numpy(dtype=float)
+def compute_envelope_from_raw(raw, fs, bp_low, bp_high, bp_order, env_win_samples):
+    raw = np.asarray(raw, dtype=float)
+    raw = raw - np.nanmean(raw)
+    # design bandpass (safeguard)
+    nyq = fs / 2.0
+    low = bp_low / nyq
+    high = bp_high / nyq
+    if low <= 0: low = 1e-6
+    if high >= 1: high = 0.999999
+    if low >= high:
+        # fallback: no filtering
+        spiky = raw.copy()
+    else:
+        try:
+            b, a = signal.butter(bp_order, [low, high], btype='band')
+            spiky = signal.filtfilt(b, a, raw)
+        except Exception:
+            # fallback to causal filter if filtfilt fails
+            b, a = signal.butter(bp_order, [low, high], btype='band')
+            spiky = signal.lfilter(b, a, raw)
+    # envelope: RMS via movmean on squared signal
+    squared = np.abs(spiky) ** 2
+    env = np.sqrt(movmean(squared, env_win_samples))
+    return spiky, env
+
+def synthesize_spiky_from_rms(rms, fs, bp_low, bp_high, bp_order, env_win_samples, random_seed=None):
+    # create band-limited noise, measure its envelope, scale to RMS
+    N = len(rms)
+    rng = np.random.default_rng(random_seed)
+    noise = rng.standard_normal(N)
+    # bandpass filter the noise
+    nyq = fs / 2.0
+    low = max(bp_low / nyq, 1e-6)
+    high = min(bp_high / nyq, 0.999999)
+    try:
+        b, a = signal.butter(bp_order, [low, high], btype='band')
+        w = signal.filtfilt(b, a, noise)
+    except Exception:
+        b, a = signal.butter(bp_order, [low, high], btype='band')
+        w = signal.lfilter(b, a, noise)
+    # envelope of w:
+    mov = np.sqrt(movmean(w**2, env_win_samples))
+    mov[mov == 0] = np.finfo(float).eps
+    # scale w to match target rms
+    w_scaled = w * (rms / mov)
+    env = rms  # keep the given RMS envelope
+    return w_scaled, env
+
+# -----------------------
+# UI - Sidebar controls
+# -----------------------
+st.sidebar.title("EMG Review Dashboard")
+st.sidebar.write("Upload an Excel file with sheet(s) containing EMG data (time, raw, or RMS).")
+
+uploaded = st.sidebar.file_uploader("Excel (.xlsx/.xls)", type=["xlsx", "xls"])
+if uploaded is None:
+    st.sidebar.info("Upload an Excel file to enable processing options.")
+
+st.sidebar.markdown("### Processing options")
+sampling_rate = st.sidebar.number_input("Sampling Rate (Hz)", value=1000, min_value=1, step=1)
+rms_window_ms = st.sidebar.slider("Envelope/RMS window (ms)", min_value=10, max_value=500, value=50)
+env_win_samples = max(1, int((rms_window_ms / 1000.0) * sampling_rate))
+st.sidebar.write(f"Envelope window ≈ {env_win_samples} samples")
+
+st.sidebar.markdown("**Bandpass filter (for spiky)**")
+apply_bp = st.sidebar.checkbox("Apply bandpass", value=True)
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    bp_low = st.number_input("f_low (Hz)", value=20.0, min_value=0.1, format="%.1f")
+with col2:
+    bp_high = st.number_input("f_high (Hz)", value=450.0, min_value=bp_low + 1.0, format="%.1f")
+bp_order = st.sidebar.selectbox("Filter order (Butterworth)", options=[2, 4, 6], index=1)
+
+st.sidebar.markdown("---")
+process_mode = st.sidebar.radio("Process", options=["Selected sheet only", "Process ALL sheets"], index=0)
+st.sidebar.markdown("---")
+run_button = st.sidebar.button("Process & Plot")
+
+# -----------------------
+# Main panel - header
+# -----------------------
+st.title("EMG Review — Spiky + Envelope Dashboard")
+st.write("This dashboard visualizes EMG traces as 'spiky' bandpassed signals and their RMS envelopes. "
+         "It can synthesize a spiky signal from RMS-only sheets and export processed results.")
+
+if uploaded is None:
+    st.info("Upload an Excel file using the sidebar to begin.")
+    st.stop()
+
+# -----------------------
+# Read Excel and sheet selection
+# -----------------------
+try:
+    xls = safe_read_excel(uploaded)
+    sheet_names = xls.sheet_names
+except Exception as e:
+    st.error(str(e))
+    st.stop()
+
+st.sidebar.write(f"Loaded file with {len(sheet_names)} sheet(s).")
+sheet = st.selectbox("Select a sheet to preview", options=sheet_names)
+
+# preview the chosen sheet
+try:
+    df_preview = pd.read_excel(xls, sheet_name=sheet)
+except Exception as e:
+    st.error(f"Unable to read sheet {sheet}: {e}")
+    st.stop()
+
+st.write("### Preview")
+st.dataframe(df_preview.head())
+
+# allow user to override column detection if desired
+st.write("### Column detection (automatic)")
+cols = df_preview.columns.tolist()
+cols_lower = lower_list(cols)
+
+time_guess = find_first_match(cols_lower, TIME_CANDIDATES)
+rms_guess = find_first_match(cols_lower, EMG_RMS_CANDIDATES)
+raw_guess = find_first_match(cols_lower, EMG_RAW_CANDIDATES)
+
+col_time = st.selectbox("Time column (detected)", options=[None] + cols, index=(cols.index(cols[time_guess]) + 1) if time_guess is not None else 0)
+col_rms = st.selectbox("EMG RMS column (detected)", options=[None] + cols, index=(cols.index(cols[rms_guess]) + 1) if rms_guess is not None else 0)
+col_raw = st.selectbox("EMG Raw column (detected)", options=[None] + cols, index=(cols.index(cols[raw_guess]) + 1) if raw_guess is not None else 0)
+
+# -----------------------
+# Processing engine
+# -----------------------
+def process_sheet_table(table: pd.DataFrame, time_col=None, raw_col=None, rms_col=None,
+                        fs=1000, bp_low_hz=20.0, bp_high_hz=450.0, bp_order=4, env_win_samples=50,
+                        baseline_sheets=BASELINE_SHEETS):
+    """
+    Returns a dict:
+      {
+        'sheet_name': name,
+        'time': np.array,
+        'spiky': np.array,
+        'env': np.array,
+        'xEnd': float
+      }
+    """
+    T = table.copy()
+    names = T.columns.tolist()
+    names_lower = lower_list(names)
+
+    # find columns if not provided
+    # time
+    if time_col is None:
+        idx = find_first_match(names_lower, TIME_CANDIDATES)
+        time_col_use = names[idx] if idx is not None else names[0]
+    else:
+        time_col_use = time_col
+
+    if rms_col is None:
+        idx = find_first_match(names_lower, EMG_RMS_CANDIDATES)
+        rms_col_use = names[idx] if idx is not None else None
+    else:
+        rms_col_use = rms_col
+
+    if raw_col is None:
+        idx = find_first_match(names_lower, EMG_RAW_CANDIDATES)
+        raw_col_use = names[idx] if idx is not None else None
+    else:
+        raw_col_use = raw_col
+
+    # Extract time
+    Time = T[time_col_use] if time_col_use in T.columns else pd.Series(np.arange(len(T)))
+    # robust convert time to seconds numeric if possible
+    if np.issubdtype(Time.dtype, np.datetime64):
+        Time = (Time - Time.iloc[0]).dt.total_seconds()
+    Time = ensure_numeric(Time)
+    # fallback if entire column NaN
+    if np.all(np.isnan(Time)):
+        Time = np.arange(len(T)) / float(fs)
+
+    # extract RMS
+    EMGrms = None
+    if rms_col_use and rms_col_use in T.columns:
+        EMGrms = ensure_numeric(T[rms_col_use].values)
+    # extract raw
+    EMGraw = None
+    if raw_col_use and raw_col_use in T.columns:
+        EMGraw = ensure_numeric(T[raw_col_use].values)
+
+    # Drop rows where time or rms are NaN
+    mask = ~np.isnan(Time)
+    if EMGrms is not None:
+        mask = mask & ~np.isnan(EMGrms)
+    if EMGraw is not None:
+        mask = mask & ~np.isnan(EMGraw)
+
+    Time = Time[mask]
+    if EMGrms is not None:
+        EMGrms = EMGrms[mask]
+    if EMGraw is not None:
+        EMGraw = EMGraw[mask]
+
+    # Estimate sampling frequency from time vector
+    if len(Time) >= 3:
+        dt = np.median(np.diff(Time))
+        fs_est = 1.0 / dt if dt > 0 else fs
+    else:
+        fs_est = fs
+
+    # adjust bandpass if fs small
+    local_bp_low = float(bp_low_hz)
+    local_bp_high = float(bp_high_hz)
+    if fs_est <= 2 * local_bp_high:
+        local_bp_high = max( (fs_est / 2.0) - 1.0, local_bp_low + 1.0)
+
+    # Build spiky and env
+    if EMGraw is not None and len(EMGraw) >= 3:
+        spiky, env = compute_envelope_from_raw(EMGraw, fs_est, local_bp_low, local_bp_high, bp_order, env_win_samples)
+    elif EMGrms is not None:
+        spiky, env = synthesize_spiky_from_rms(EMGrms, fs_est, local_bp_low, local_bp_high, bp_order, env_win_samples, random_seed=42)
+    else:
+        # nothing useful
+        raise ValueError("Sheet contains neither raw EMG nor RMS columns we can detect.")
+
+    # Determine xEnd based on sheet name heuristic
+    # If sheet name indicates baseline, short xEnd
+    # else longer trial default
+    # caller can adjust
+    return {
+        'time': np.array(Time, dtype=float),
+        'spiky': np.array(spiky, dtype=float),
+        'env': np.array(env, dtype=float),
+        'fs_est': fs_est
+    }
+
+# -----------------------
+# Plotting utility
+# -----------------------
+def plot_polished_tiles(data_list, title_prefix="EMG"):
+    # data_list: list of dicts with keys: sheet_name, time, spiky, env, xEnd
+    n = len(data_list)
+    if n == 0:
+        st.warning("No data to plot.")
+        return
+
+    # compute global amplitude
+    global_max = 0.0
+    for d in data_list:
+        global_max = max(global_max, np.nanmax(np.abs(np.concatenate([d['spiky'], d['env']] ))))
+
+    if global_max <= 0:
+        global_max = 1.0
+    Ymax = np.ceil(global_max / 0.5) * 0.5
+    YL = (-Ymax, Ymax)
+    y_ticks = np.arange(YL[0], YL[1] + 1e-9, 0.5)
+
+    # Create tiled layout: try square-ish grid
+    rows = int(np.ceil(np.sqrt(n)))
+    cols = int(np.ceil(n / rows))
+
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 3.5 * rows), squeeze=False)
+    axes = axes.flatten()
+
+    for ax in axes[n:]:
+        ax.axis('off')
+
+    for i, d in enumerate(data_list):
+        ax = axes[i]
+        Time = d['time']
+        spiky = d['spiky']
+        env = d['env']
+        sheet = d.get('sheet_name', f"Sheet {i+1}")
+
+        # If Time doesn't reach xEnd, append last point to extend to xEnd
+        sheet_lower = sheet.lower()
+        if any(key in sheet_lower for key in BASELINE_SHEETS):
+            xEnd = 5
+            xticks = np.arange(0, xEnd + 0.1, 0.5)
         else:
-            x_vals = np.arange(len(df))
+            xEnd = 15
+            xticks = np.arange(0, xEnd + 0.1, 1.0)
 
-        fig = go.Figure()
-        processed_tables = {}
-        
-        # Compute windows
-        # MATLAB uses 50ms window for envelope, which is RMS for filtered raw signal
-        rms_window_samples = max(1, int(round((rms_window_ms / 1000.0) * sample_rate)))
-        smooth_window_samples = max(1, int(smooth_window_samples))
+        # sort
+        order = np.argsort(Time)
+        Time_s = Time[order]
+        sp = spiky[order]
+        en = env[order]
 
-        # Design filters
-        sos_hp = design_filter('high', hp_cut, sample_rate, order=4) if (not bandpass_enabled and hp_cut > 0) else None
-        sos_lp = design_filter('low', lp_cut, sample_rate, order=4) if (not bandpass_enabled and lp_cut > 0) else None
-        sos_bp = design_filter('band', (bp_low, bp_high), sample_rate, order=4) if bandpass_enabled else None
+        if Time_s[-1] < xEnd:
+            Time_s = np.concatenate([Time_s, [xEnd]])
+            sp = np.concatenate([sp, [sp[-1]]])
+            en = np.concatenate([en, [en[-1]]])
 
-        # --- Processing Loop ---
-        for ch in sel_channels:
-            series = to_numeric_series(df[ch])
-            arr = series.to_numpy(dtype=float)
-            
-            # 1. Detrend / Center Data (Mimicking MATLAB raw - mean(raw))
-            # Since EMG is typically AC coupled, we just remove the mean.
-            arr_detrended = arr - np.nanmean(arr)
+        # fill envelope ±env (use alpha)
+        upper = en
+        lower_env = -en
+        xx = np.concatenate([Time_s, Time_s[::-1]])
+        yy = np.concatenate([upper, lower_env[::-1]])
+        ax.fill_between(Time_s, lower_env, upper, color=(1.0, 0.6, 0.2), alpha=0.18, edgecolor='none')
 
-            # 2. Apply Bandpass or Cascade filter
-            if bandpass_enabled and sos_bp is not None:
-                filtered_signal = apply_sos_filter(arr_detrended, sos_bp)
+        # spiky & envelope lines
+        ax.plot(Time_s, sp, color=(0.0, 0.4470, 0.7410, 0.65), linewidth=0.6)
+        ax.plot(Time_s, en, color=(0.85, 0.325, 0.098), linewidth=1.2)
+        ax.plot(Time_s, -en, color=(0.85, 0.325, 0.098, 0.6), linestyle='--', linewidth=0.9)
+
+        ax.set_title(f"{title_prefix} – {sheet}", fontweight='bold', fontsize=10)
+        ax.set_xlabel("Time (s)", fontsize=9)
+        ax.set_ylabel("Amplitude", fontsize=9)
+        ax.grid(True, alpha=0.35)
+        ax.set_xlim(0, xEnd)
+        ax.set_ylim(YL)
+        ax.set_yticks(y_ticks)
+        ax.tick_params(axis='both', which='major', labelsize=9)
+
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+# -----------------------
+# Run processing
+# -----------------------
+if run_button:
+    # decide sheets to process
+    if process_mode == "Selected sheet only":
+        sheets_to_process = [sheet]
+    else:
+        sheets_to_process = sheet_names
+
+    st.info(f"Processing {len(sheets_to_process)} sheet(s)...")
+    processed_results = []
+    errors = {}
+
+    for sh in sheets_to_process:
+        try:
+            df_sh = pd.read_excel(xls, sheet_name=sh)
+            # choose columns: use user-chosen overrides only if processing the selected sheet
+            if sh == sheet:
+                tcol = col_time if col_time != "None" else None
+                rcol = col_rms if col_rms != "None" else None
+                rawcol = col_raw if col_raw != "None" else None
             else:
-                filtered_signal = arr_detrended.copy()
-                if sos_hp is not None:
-                    filtered_signal = apply_sos_filter(filtered_signal, sos_hp)
-                if sos_lp is not None:
-                    filtered_signal = apply_sos_filter(filtered_signal, sos_lp)
-            
-            # The MATLAB 'spiky' signal is this filtered signal
-            spiky = filtered_signal
-            
-            # 3. Calculate RMS Envelope (The "env" in MATLAB)
-            # EMG envelope is often approximated by the RMS of the filtered, rectified signal.
-            # MATLAB uses sqrt(movmean(abs(spiky).^2, envWin)), which is RMS of spiky signal.
-            rms_env = moving_rms(spiky, rms_window_samples)
-            
-            # 4. Apply Final Smoothing (The final visible line on the MATLAB plot)
-            rms_smooth = moving_average(rms_env, smooth_window_samples)
-            
-            # --- Plotting (Mimic MATLAB's Look) ---
-            
-            # Add Shaded Area (The ±Envelope patch)
-            # Plotly equivalent of fill(xx, yy)
-            fill_color = 'rgba(255, 102, 0, 0.18)' # Orange/red transparent fill
-            
-            fig.add_trace(go.Scatter(
-                x=np.concatenate([x_vals, x_vals[::-1]]),
-                y=np.concatenate([rms_smooth, -rms_smooth[::-1]]),
-                fill='toself',
-                fillcolor=fill_color,
-                line=dict(width=0),
-                name=f"{ch} Envelope Area",
-                hoverinfo='skip',
-                legendgroup=ch,
-                showlegend=True
-            ))
-            
-            # Add Spiky/Raw Filtered Signal (The 'spiky' line)
-            fig.add_trace(go.Scatter(
-                x=x_vals, y=spiky, 
-                mode='lines', 
-                name=f"{ch} (Filtered Signal)", 
-                line=dict(width=0.6, color='rgba(0, 71, 120, 0.55)'), # Blue transparent
-                legendgroup=ch,
-                hoverinfo='x+y',
-                showlegend=True 
-            ))
-            
-            # Add Positive RMS Envelope (The solid line)
-            fig.add_trace(go.Scatter(
-                x=x_vals, y=rms_smooth, 
-                mode='lines', 
-                name=f"{ch} (RMS Envelope)", 
-                line=dict(width=1.4, color='rgb(217, 83, 25)'), # Dark Orange
-                legendgroup=ch,
-                hoverinfo='x+y',
-                showlegend=True
-            ))
-            
-            # Add Negative RMS Envelope (The dashed line)
-            fig.add_trace(go.Scatter(
-                x=x_vals, y=-rms_smooth, 
-                mode='lines', 
-                name=f"{ch} (Negative Envelope)", 
-                line=dict(width=0.8, dash='dash', color='rgba(217, 83, 25, 0.6)'),
-                legendgroup=ch,
-                hoverinfo='skip',
-                showlegend=False # Hide from legend for cleaner look
-            ))
-            
-            # --- Table for Export ---
-            table_df = pd.DataFrame({
-                x_col: x_vals, 
-                f"{ch}_raw_filtered": spiky, 
-                f"{ch}_rms_envelope": rms_smooth
-            })
-            processed_tables[ch] = table_df
+                tcol = None; rcol = None; rawcol = None
 
-        # --- Figure Layout ---
-        fig.update_layout(
-            height=600, 
-            template="plotly_white",
-            title=dict(
-                text=f"**EMG Analysis**: Sheet **{sel_sheet}**", 
-                font=dict(size=20, color='#1a1a1a')
-            ),
-            xaxis_title=x_col + (' (s)' if x_is_numeric else ''), 
-            yaxis_title="Amplitude ($\mu V$ or mV)",
-            legend=dict(
-                orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
-                bgcolor='rgba(255,255,255,0.7)', bordercolor="#cccccc", borderwidth=1
-            ),
-            hovermode="x unified",
-            margin=dict(l=40, r=40, t=100, b=40)
-        )
+            data = process_sheet_table(df_sh, time_col=tcol, raw_col=rawcol, rms_col=rcol,
+                                       fs=sampling_rate, bp_low_hz=bp_low, bp_high_hz=bp_high,
+                                       bp_order=bp_order, env_win_samples=env_win_samples)
+            data['sheet_name'] = sh
+            processed_results.append(data)
+        except Exception as e:
+            errors[sh] = str(e)
 
-        st.plotly_chart(fig, use_container_width=True)
-        st.markdown("---")
-        
-        # --- Download Options ---
-        st.subheader("Download Processed Data")
-        
-        # Combine processed tables
-        combined = None
-        for ch, tdf in processed_tables.items():
-            if combined is None:
-                combined = tdf
-            else:
-                combined = pd.concat([combined, tdf.drop(columns=[x_col])], axis=1)
+    if len(processed_results) == 0:
+        st.error("No sheets were successfully processed. See errors below.")
+        st.write(errors)
+    else:
+        st.success(f"Processed {len(processed_results)} / {len(sheets_to_process)} sheets successfully.")
+        if errors:
+            st.warning("Some sheets failed to process. See details below.")
+            st.write(errors)
 
-        if combined is not None:
-            col_csv, col_png = st.columns(2)
-            
-            # CSV Download
-            csv_bytes = combined.to_csv(index=False).encode('utf-8')
-            col_csv.download_button("💾 Download Processed CSV", data=csv_bytes, file_name=f"{sel_sheet}_processed.csv", mime="text/csv")
-            
-            # PNG Download
-            try:
-                # Add a high-resolution export for a professional PNG
-                png_bytes = fig.to_image(format="png", width=1600, height=900, scale=2) 
-                col_png.download_button("🖼️ Download Chart PNG", data=png_bytes, file_name=f"{sel_sheet}_chart.png", mime="image/png")
-            except Exception:
-                 col_png.info("PNG chart export requires the `kaleido` package (`pip install kaleido`).")
+        # Plot polished tiles
+        plot_polished_tiles(processed_results, title_prefix="EMG")
 
-        # --- Summary of Analysis ---
-        st.subheader("Analysis Parameters Summary")
-        
-        rms_window_str = f"{rms_window_ms} ms (≈ {rms_window_samples} samples)"
-        smooth_window_str = f"{smooth_window_samples} samples"
-        
-        if bandpass_enabled:
-            filter_str = f"Bandpass: {bp_low} Hz – {bp_high} Hz (4th Order Butterworth)"
+        # Build export: multi-sheet Excel + option for zip of CSVs
+        st.write("### Export processed results")
+        export_mode = st.radio("Export format", options=["Single multi-sheet Excel (.xlsx)", "ZIP of CSVs"], index=0)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        if export_mode.startswith("Single"):
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine='openpyxl') as writer:
+                for d in processed_results:
+                    dfout = pd.DataFrame({
+                        'time_s': d['time'],
+                        'spiky': d['spiky'],
+                        'env': d['env']
+                    })
+                    # ensure sheet name length safe for Excel
+                    sheet_safe = (d['sheet_name'][:30]) if d['sheet_name'] else f"Sheet_{len(d)}"
+                    dfout.to_excel(writer, sheet_name=sheet_safe, index=False)
+                writer.save()
+            out.seek(0)
+            st.download_button(f"Download processed_{timestamp}.xlsx", data=out, file_name=f"processed_{timestamp}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else:
-            filter_str = "Filter Cascade: "
-            filter_str += f"Highpass: {hp_cut} Hz. " if hp_cut > 0 else ""
-            filter_str += f"Lowpass: {lp_cut} Hz." if lp_cut > 0 else ""
-            if not hp_cut and not lp_cut:
-                 filter_str = "No digital filtering applied."
+            # zip of CSVs
+            in_memory = io.BytesIO()
+            with zipfile.ZipFile(in_memory, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+                for d in processed_results:
+                    dfout = pd.DataFrame({
+                        'time_s': d['time'],
+                        'spiky': d['spiky'],
+                        'env': d['env']
+                    })
+                    csv_bytes = dfout.to_csv(index=False).encode('utf-8')
+                    filename = f"{d['sheet_name'][:80]}.csv"
+                    zf.writestr(filename, csv_bytes)
+            in_memory.seek(0)
+            st.download_button(f"Download processed_{timestamp}.zip", data=in_memory, file_name=f"processed_{timestamp}.zip", mime="application/zip")
 
-        st.table(pd.DataFrame({
-            'Parameter': ['Sampling Rate', 'RMS Window', 'Smoothing Window', 'Digital Filter'],
-            'Value': [f"{sample_rate} Hz", rms_window_str, smooth_window_str, filter_str]
-        }))
+    st.balloons()
 
 else:
-    st.info("⬆️ Upload an Excel file to begin analyzing your EMG data.")
-    st.markdown("""
-    **Workflow Guide:**
-    1. **Upload** your `.xlsx` or `.xls` file.
-    2. **Select** the sheet and the channels you wish to analyze from the sidebar.
-    3. **Adjust** the signal processing parameters (Sampling Rate, RMS/Smoothing Windows) in the sidebar.
-    4. **Click** the 'Process & Plot EMG Data' button to visualize the filtered signal and its smoothed RMS envelope.
-    """)
+    st.write("Click **Process & Plot** in the sidebar to start processing the selected sheet(s).")
